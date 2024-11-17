@@ -4,6 +4,8 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from bpy_extras import view3d_utils
 import blf
+import mathutils
+
 
 # Store the line coordinates and lengths globally
 lines = []  # This will hold pairs of (start, end) points for each line
@@ -16,8 +18,8 @@ lines_visible = True  # Control whether lines are visible or hidden
 drawing_active = False  # Flag to track if the draw operator is active
 hovered_vertex = None  # Store the currently hovered vertex
 # The distance threshold for highlighting a vertex
-vertex_highlight_threshold = 0.05  # Adjust this threshold as needed
-edge_highlight_threshold = 5
+vertex_highlight_threshold = 10  # Adjust this threshold as needed
+edge_highlight_threshold = 1
 length_draw_handler = None
 
 
@@ -83,19 +85,6 @@ def update_hovered_edge(context, event):
                     closest_point_3d = vert1_world + t * (vert2_world - vert1_world)
                     best_dist_edge = dist_2d
                     hovered_edge = closest_point_3d
-               #     print("update_hovered_edge: Edge within range, setting hovered_edge.")
-
-   # if not hovered_edge:
-    #    print("update_hovered_edge: Edge snapping stopped, hovered_edge is None.")
-
-
-
-
-
-
-
-
-
 
             
             
@@ -130,15 +119,6 @@ def update_hovered_vertex(context, event):
         if area.type == 'VIEW_3D':
             area.tag_redraw()
 
-# Function to check if the mouse is close to a vertex
-def is_mouse_near_vertex(mouse_2d, vertex_world_pos, context):
-    region = context.region
-    region_3d = context.space_data.region_3d
-    vertex_2d = view3d_utils.location_3d_to_region_2d(region, region_3d, vertex_world_pos)
-    if vertex_2d is None:
-        return False
-    distance = (mouse_2d - vertex_2d).length
-    return distance < vertex_highlight_threshold
 
 # Function to convert 2D mouse coordinates into 3D space (using a depth reference point)
 def mouse_to_3d(context, event, depth_location):
@@ -193,34 +173,45 @@ def draw():
     # Draw the hovered edge midpoint if there is one
      # Draw the hovered edge midpoint if there is one and no vertex is hovered
     if hovered_edge and not hovered_vertex:
-        #print('edge hovered')
         square_size = 8
         region = bpy.context.region
         region_3d = bpy.context.space_data.region_3d
 
         # Project the hovered edge point to 2D screen space
-        screen_pos = view3d_utils.location_3d_to_region_2d(region, region_3d, hovered_edge)
+        screen_pos_edge = view3d_utils.location_3d_to_region_2d(region, region_3d, hovered_edge)
+        print(f"Screen position for hovered edge: {screen_pos_edge}")
 
-        if screen_pos:
+        if screen_pos_edge:
+            # Create 2D points for the square
             square_2d_points = [
-                (screen_pos[0] - square_size, screen_pos[1] - square_size),
-                (screen_pos[0] + square_size, screen_pos[1] - square_size),
-                (screen_pos[0] + square_size, screen_pos[1] + square_size),
-                (screen_pos[0] - square_size, screen_pos[1] + square_size)
+                (screen_pos_edge[0] - square_size, screen_pos_edge[1] - square_size),
+                (screen_pos_edge[0] + square_size, screen_pos_edge[1] - square_size),
+                (screen_pos_edge[0] + square_size, screen_pos_edge[1] + square_size),
+                (screen_pos_edge[0] - square_size, screen_pos_edge[1] + square_size)
             ]
 
+            # Convert 2D points back to 3D using hovered_edge as the depth reference
             square_3d_points = [
                 view3d_utils.region_2d_to_location_3d(region, region_3d, point, hovered_edge)
                 for point in square_2d_points
             ]
 
+            # Check if the points are valid
             if None not in square_3d_points:
-                gpu.state.line_width_set(1.4)
-                outline_batch = batch_for_shader(highlight_shader, 'LINE_LOOP', {"pos": square_3d_points})
-                highlight_shader.bind()
-                highlight_shader.uniform_float("color", (0, 1, 0, 1))  # Green color for edge
-                outline_batch.draw(highlight_shader)
+              #  print(f"3D Points for Edge Square: {square_3d_points}")
 
+                # Draw the square in 3D space
+                gpu.state.line_width_set(1.4)
+                outline_batch = batch_for_shader(
+                    highlight_shader, 'LINE_LOOP', {"pos": square_3d_points}
+                )
+                highlight_shader.bind()
+                highlight_shader.uniform_float("color", (0, 1, 0, 1))  # Green color
+                outline_batch.draw(highlight_shader)
+            else:
+                print("Invalid 3D points for edge square.")
+        else:
+            print("Hovered edge is outside the viewport or screen_pos_edge is None.")
 
 
 def draw_dashed_line(start, end, dash_length=0.5, gap_length=None, thickness=3):
@@ -256,6 +247,9 @@ def draw_dashed_line(start, end, dash_length=0.5, gap_length=None, thickness=3):
         batch.draw(shader)
     
     gpu.state.line_width_set(1)  # Reset line thickness after drawing
+
+
+
 
 
 # Function to draw length text dynamically at the midpoint of each line
@@ -438,37 +432,14 @@ class ModalDrawOperator(bpy.types.Operator):
                     if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
                         return {'PASS_THROUGH'}
 
-                    # The distance threshold for highlighting a vertex
-                    vertex_highlight_threshold = 20  # Set to 1.0 to highlight the vertex only within this distance
-                    edge_highlight_threshold = 20  # Distance threshold for edge highlighting
 
-                    # Function to check if the mouse is close to a vertex
-                    def is_mouse_near_vertex(mouse_2d, vertex_world_pos, context):
-                        region = context.region
-                        region_3d = context.space_data.region_3d
-                        vertex_2d = view3d_utils.location_3d_to_region_2d(region, region_3d, vertex_world_pos)
-                        if vertex_2d is None:
-                            return False
-                        distance = (mouse_2d - vertex_2d).length
-                        return distance < vertex_highlight_threshold
-                    
-                    # Function to check if the mouse is close to an edge
-                    def is_mouse_near_edge(mouse_2d, edge_world_pos, context):
-                        region = context.region
-                        region_3d = context.space_data.region_3d
-                        edge_2d = view3d_utils.location_3d_to_region_2d(region, region_3d, edge_world_pos)
-                        if edge_2d is None:
-                            return False
-                        distance = (mouse_2d - edge_2d).length
-                        return distance < edge_highlight_threshold
+                
 
                     if event.type == 'MOUSEMOVE':
-                        update_hovered_vertex(context, event)
+                        
                         update_hovered_edge(context, event)
-                      #  if hovered_edge is None:
-                        #    print("modal: Confirming no edge in range; resetting hovered_edge to None.")
-                       # if hovered_vertex is None:
-                         #   print("modal: Confirming no vertex in range; resetting hovered_vertex to None.")
+                        update_hovered_vertex(context, event)
+
                         depsgraph = context.evaluated_depsgraph_get()
                         depsgraph.update()
 
@@ -499,29 +470,37 @@ class ModalDrawOperator(bpy.types.Operator):
                                             hovered_vertex = world_pos
                                             self.hovered_vertex_ref = (obj, v.index)
 
-                                # Check edges only if no vertex is close enough
+                                # Use raycasting to find the precise intersection on the geometry
                                 if not hovered_vertex:
-                                    for edge in obj.data.edges:
-                                        vert1_world = matrix @ obj.data.vertices[edge.vertices[0]].co
-                                        vert2_world = matrix @ obj.data.vertices[edge.vertices[1]].co
-                                        edge_vector = vert2_world - vert1_world
-                                        edge_length = edge_vector.length
-                                        edge_vector.normalize()
+                                    view_origin = region_3d.view_matrix.inverted().translation
+                                    view_direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
 
-                                        mouse_3d = view3d_utils.region_2d_to_location_3d(region, region_3d, coord, vert1_world)
-                                        proj_vector = mouse_3d - vert1_world
-                                        t = proj_vector.dot(edge_vector) / edge_length
-                                        t = max(0.0, min(1.0, t))
+                                    # Perform raycast
+                                    hit_result = context.scene.ray_cast(
+                                        context.view_layer.depsgraph, view_origin, view_direction
+                                    )
 
-                                        closest_point = vert1_world + t * edge_vector * edge_length
+                                    if hit_result[0]:  # Check if the ray hit something
+                                        location = hit_result[1]  # Intersection point
+                                        hovered_point = location  # Snapped point on geometry
 
-                                        screen_pos_edge = view3d_utils.location_3d_to_region_2d(region, region_3d, closest_point)
-                                        if screen_pos_edge:
-                                            dist = (Vector(coord) - screen_pos_edge).length
+                                        for edge in obj.data.edges:
+                                            vert1_world = matrix @ obj.data.vertices[edge.vertices[0]].co
+                                            vert2_world = matrix @ obj.data.vertices[edge.vertices[1]].co
+
+                                            # Use raycast point to find closest edge
+                                            closest_point, t = mathutils.geometry.intersect_point_line(
+                                                hovered_point, vert1_world, vert2_world
+                                            )
+                                            dist = (hovered_point - closest_point).length
                                             if dist < edge_highlight_threshold and dist < best_dist_edge:
                                                 best_dist_edge = dist
                                                 hovered_edge = closest_point
                                                 self.hovered_edge_ref = (obj, edge.index)
+
+
+
+
                                                 
 
                         # Start with the base position under the mouse, and apply snapping conditionally
@@ -547,15 +526,15 @@ class ModalDrawOperator(bpy.types.Operator):
                                 if not any(self.axis_lock.values()):
                                     current_pos = hovered_edge
                                     print("modal: Snapping to edge.")
-                                    print(current_pos)
                                 else:
-                                    # Snap to the hovered vertex's coordinates, respecting locked axes
+                                    # Snap to the hovered edge's coordinates, respecting locked axes
                                     if self.axis_lock['X']:
-                                        current_pos[0] = hovered_edge[0]  # Keep X axis locked
+                                        current_pos.x = hovered_edge.x
                                     if self.axis_lock['Y']:
-                                        current_pos[1] = hovered_edge[1]  # Keep Y axis locked
+                                        current_pos.y = hovered_edge.y
                                     if self.axis_lock['Z']:
-                                        current_pos[2] = hovered_edge[2]  # Keep Z axis locked
+                                        current_pos.z = hovered_edge.z
+
 
                             # Apply axis locking
                             if self.axis_lock['X']:
