@@ -5,32 +5,29 @@ from mathutils import Vector
 from bpy_extras import view3d_utils
 import blf
 import mathutils
+import bmesh
+from mathutils.bvhtree import BVHTree
 
-
+line_colors = []  # This will store colors for each line
 # Store the line coordinates and lengths globally
 lines = []  # This will hold pairs of (start, end) points for each line
 line_vertex_refs = []  # This will hold references to vertices (object, vertex index) for dynamic updates
-
 line_dynamic_flags = []  # This holds dynamic flags for each line's start and endpoint
+line_colors = []  # This will hold the colors for each line
 font_info = {"font_id": 0, "handler": None}
 first_line_drawn = False  # Flag to indicate if at least one line has been drawn
 lines_visible = True  # Control whether lines are visible or hidden
 drawing_active = False  # Flag to track if the draw operator is active
 hovered_vertex = None  # Store the currently hovered vertex
-# The distance threshold for highlighting a vertex
+hovered_edge = None  # Store the currently hovered edge
 vertex_highlight_threshold = 10  # Adjust this threshold as needed
 edge_highlight_threshold = 1
 length_draw_handler = None
-
 
 # Shader and batch for drawing the lines
 shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 highlight_shader = gpu.shader.from_builtin('UNIFORM_COLOR')  # Shader for the hovered vertex
 
-
-
-
-# Define a font size property in the Scene
 bpy.types.Scene.font_size = bpy.props.FloatProperty(
     name="Font Size",
     description="Adjust the font size for line measurements",
@@ -38,88 +35,133 @@ bpy.types.Scene.font_size = bpy.props.FloatProperty(
     min=10.0,
     max=50.0
 )
-# Global variable to store the currently hovered edge
-hovered_edge = None
 
-def update_hovered_edge(context, event):
-    global hovered_edge
-    hovered_edge = None  # Reset hovered edge at the beginning
-    #print("update_hovered_edge: Reset hovered_edge to None")
+# Cache to store BVH trees per object
+bvh_cache = {}
 
-    # Get the depsgraph
-    depsgraph = context.evaluated_depsgraph_get()
-    depsgraph.update()
+def add_line_color(index):
+    def update_color(self, context):
+        line_colors[index] = getattr(context.scene, f"line_color_{index}")
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
-    best_dist_edge = float('inf')
+    color_property_name = f"line_color_{index}"
+
+    # Check if the property already exists in the scene
+    if hasattr(bpy.types.Scene, color_property_name):
+        # Reset the property to the default value if it exists
+        setattr(bpy.context.scene, color_property_name, (1.0, 1.0, 0.0, 1.0))  # Default yellow color
+    else:
+        # Create a new property if it doesn't exist
+        setattr(bpy.types.Scene, color_property_name, bpy.props.FloatVectorProperty(
+            name=f"Line {index} Color",
+            subtype='COLOR',
+            size=4,
+            min=0.0, max=1.0,
+            default=(1.0, 1.0, 0.0, 1.0),  # Default yellow color
+            update=update_color  # Use callback for updates
+        ))
+
+    # Add the default color to the line_colors list
+    line_colors.append((1.0, 1.0, 0.0, 1.0))
+
+
+def build_bvh(obj):
+    """Build and cache a BVH tree for the given object."""
+    if obj.type != 'MESH':
+        return None
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+
+    # Create BVH tree from the evaluated mesh
+    bvh_tree = BVHTree.FromObject(eval_obj, depsgraph)
+    eval_obj.to_mesh_clear()  # Clean up temporary mesh
+    return bvh_tree
+
+
+def get_bvh(obj):
+    """Get or build a BVH tree for the given object."""
+    if obj not in bvh_cache or bvh_cache[obj]["dirty"]:
+        bvh_tree = build_bvh(obj)
+        if bvh_tree:
+            bvh_cache[obj] = {"bvh": bvh_tree, "dirty": False}
+    return bvh_cache[obj]["bvh"]
+
+
+def mark_bvh_dirty(obj):
+    """Mark BVH tree as dirty if the object is modified."""
+    if obj in bvh_cache:
+        bvh_cache[obj]["dirty"] = True
+
+
+def update_hovered_geometry(context, event):
+    """Efficiently update hovered vertex or edge based on the mouse position."""
+    hovered_vertex = None
+    hovered_vertex_ref = None
+    hovered_edge = None
+    hovered_edge_ref = None
+
+    best_vertex_dist = float('inf')
+    best_edge_dist = float('inf')
+
     region = context.region
     region_3d = context.space_data.region_3d
     mouse_coord = Vector((event.mouse_region_x, event.mouse_region_y))
 
+    # Precompute ray origin and direction
+    ray_origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, mouse_coord)
+    ray_direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, mouse_coord)
+
     for obj in context.visible_objects:
-        if obj.type == 'MESH':
-            eval_obj = obj.evaluated_get(depsgraph)
-            matrix = eval_obj.matrix_world
+        if obj.type != 'MESH':
+            continue
 
-            for edge in eval_obj.data.edges:
-                vert1_world = matrix @ eval_obj.data.vertices[edge.vertices[0]].co
-                vert2_world = matrix @ eval_obj.data.vertices[edge.vertices[1]].co
+        matrix_world = obj.matrix_world
+        bvh_tree = get_bvh(obj)
+        if not bvh_tree:
+            continue
 
-                vert1_2d = view3d_utils.location_3d_to_region_2d(region, region_3d, vert1_world)
-                vert2_2d = view3d_utils.location_3d_to_region_2d(region, region_3d, vert2_world)
+        # Perform raycast using BVH tree
+        raycast_result = bvh_tree.ray_cast(ray_origin, ray_direction)
+        if raycast_result[0] is not None:  # If a hit is found
+            location, normal, face_index, dist = raycast_result
 
-                if vert1_2d is None or vert2_2d is None:
-                    continue  # Skip if projection fails
-
-                edge_2d_vector = vert2_2d - vert1_2d
-                edge_length_2d = edge_2d_vector.length
-                edge_2d_vector.normalize()
-
-                mouse_to_vert1_2d = mouse_coord - vert1_2d
-                t = mouse_to_vert1_2d.dot(edge_2d_vector) / edge_length_2d
-                t = max(0.0, min(1.0, t))
-
-                closest_point_2d = vert1_2d + t * edge_2d_vector * edge_length_2d
-                dist_2d = (mouse_coord - closest_point_2d).length
-
-                if dist_2d < edge_highlight_threshold and dist_2d < best_dist_edge:
-                    closest_point_3d = vert1_world + t * (vert2_world - vert1_world)
-                    best_dist_edge = dist_2d
-                    hovered_edge = closest_point_3d
-
-            
-            
-def update_hovered_vertex(context, event):
-    global hovered_vertex
-
-    depsgraph = context.evaluated_depsgraph_get()
-    depsgraph.update()
-
-    hovered_vertex = None  # Reset hovered vertex initially
-    best_dist = float('inf')
-    region = context.region
-    region_3d = context.space_data.region_3d
-    coord = (event.mouse_region_x, event.mouse_region_y)
-
-    # Iterate over all visible objects
-    for obj in context.visible_objects:
-        if obj.type == 'MESH':
-            eval_obj = obj.evaluated_get(depsgraph)
-            matrix = eval_obj.matrix_world
-            for v in eval_obj.data.vertices:
-                world_pos = matrix @ v.co
+            # Check closest vertex
+            for vertex in obj.data.vertices:
+                world_pos = matrix_world @ vertex.co
                 screen_pos = view3d_utils.location_3d_to_region_2d(region, region_3d, world_pos)
                 if screen_pos:
-                    dist = (Vector(coord) - screen_pos).length
-                    if dist < vertex_highlight_threshold and dist < best_dist:
-                        best_dist = dist
+                    vertex_dist = (mouse_coord - screen_pos).length
+                    if vertex_dist < vertex_highlight_threshold and vertex_dist < best_vertex_dist:
+                        best_vertex_dist = vertex_dist
                         hovered_vertex = world_pos
+                        hovered_vertex_ref = (obj, vertex.index)
 
-    # Force redraw after updating hovered vertex
-    for area in bpy.context.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
+            # Check closest edge using the face index from raycast
+            if face_index is not None:
+                face = obj.data.polygons[face_index]
+                for loop_index in face.loop_indices:
+                    edge_index = obj.data.loops[loop_index].edge_index
+                    edge = obj.data.edges[edge_index]
+
+                    vert1_world = matrix_world @ obj.data.vertices[edge.vertices[0]].co
+                    vert2_world = matrix_world @ obj.data.vertices[edge.vertices[1]].co
+
+                    # Find closest point on the edge
+                    closest_point, _ = mathutils.geometry.intersect_point_line(location, vert1_world, vert2_world)
+                    edge_dist = (location - closest_point).length
+                    if edge_dist < edge_highlight_threshold and edge_dist < best_edge_dist:
+                        best_edge_dist = edge_dist
+                        hovered_edge = closest_point
+                        hovered_edge_ref = (obj, edge_index)  # Store the edge index correctly
+
+    return hovered_vertex, hovered_vertex_ref, hovered_edge, hovered_edge_ref
 
 
+            
 # Function to convert 2D mouse coordinates into 3D space (using a depth reference point)
 def mouse_to_3d(context, event, depth_location):
     region = context.region
@@ -134,88 +176,72 @@ def calculate_length(start, end):
 # Drawing the lines and hovered vertex in the viewport
 import math
 
+import time
+last_update_time = 0
+update_interval = 0.02  # Limit updates to every 20ms
 
+def should_update_highlight():
+    global last_update_time
+    current_time = time.time()
+    if current_time - last_update_time > update_interval:
+        last_update_time = current_time
+        return True
+    return False
 # Drawing the lines and hovered vertex in the viewport
 def draw():
-    if lines_visible and lines:  # Only draw lines if they are visible
-        for line in lines:
-            start, end = line
-            draw_dashed_line(start, end, dash_length=0.5)
-
-    # Draw the hovered vertex if there is one
-    if hovered_vertex:
-        square_size = 8  # Adjust this value based on screen pixels rather than 3D space
+    def draw_square_around_point(screen_pos, reference_3d_point, color, square_size=8):
+        """Draws a square around a 3D point projected to 2D."""
         region = bpy.context.region
         region_3d = bpy.context.space_data.region_3d
 
-        # Project the hovered vertex to 2D screen space
-        screen_pos = view3d_utils.location_3d_to_region_2d(region, region_3d, hovered_vertex)
+        # Create 2D points for the square
+        square_2d_points = [
+            (screen_pos[0] - square_size, screen_pos[1] - square_size),
+            (screen_pos[0] + square_size, screen_pos[1] - square_size),
+            (screen_pos[0] + square_size, screen_pos[1] + square_size),
+            (screen_pos[0] - square_size, screen_pos[1] + square_size)
+        ]
 
-        if screen_pos:
-            square_2d_points = [
-                (screen_pos[0] - square_size, screen_pos[1] - square_size),
-                (screen_pos[0] + square_size, screen_pos[1] - square_size),
-                (screen_pos[0] + square_size, screen_pos[1] + square_size),
-                (screen_pos[0] - square_size, screen_pos[1] + square_size)
-            ]
+        # Convert 2D points back to 3D using the reference point for depth
+        square_3d_points = [
+            view3d_utils.region_2d_to_location_3d(region, region_3d, point, reference_3d_point)
+            for point in square_2d_points
+        ]
 
-            square_3d_points = [
-                view3d_utils.region_2d_to_location_3d(region, region_3d, point, hovered_vertex)
-                for point in square_2d_points
-            ]
-
-            gpu.state.line_width_set(1.4)  # Set to a larger value for a thicker outline
-            outline_batch = batch_for_shader(highlight_shader, 'LINE_LOOP', {"pos": square_3d_points})
+        # Check if points are valid
+        if None not in square_3d_points:
+            gpu.state.line_width_set(1.4)
+            outline_batch = batch_for_shader(
+                highlight_shader, 'LINE_LOOP', {"pos": square_3d_points}
+            )
             highlight_shader.bind()
-            highlight_shader.uniform_float("color", (1, 1, 1, 1))  # White color for outline
+            highlight_shader.uniform_float("color", color)
             outline_batch.draw(highlight_shader)
 
-    # Draw the hovered edge midpoint if there is one
-     # Draw the hovered edge midpoint if there is one and no vertex is hovered
-    if hovered_edge and not hovered_vertex:
-        square_size = 8
+    if lines_visible and lines:  # Only draw lines if they are visible
+        for index, line in enumerate(lines):
+            start, end = line
+            draw_dashed_line(start, end, dash_length=0.5, index=index)
+
+    # Draw hovered vertex
+    if hovered_vertex:
         region = bpy.context.region
         region_3d = bpy.context.space_data.region_3d
+        screen_pos = view3d_utils.location_3d_to_region_2d(region, region_3d, hovered_vertex)
+        if screen_pos:
+            draw_square_around_point(screen_pos, hovered_vertex, color=(1, 1, 1, 1))  # White
 
-        # Project the hovered edge point to 2D screen space
+    # Draw hovered edge midpoint if no vertex is hovered
+    if hovered_edge and not hovered_vertex:
+        region = bpy.context.region
+        region_3d = bpy.context.space_data.region_3d
         screen_pos_edge = view3d_utils.location_3d_to_region_2d(region, region_3d, hovered_edge)
-        print(f"Screen position for hovered edge: {screen_pos_edge}")
-
         if screen_pos_edge:
-            # Create 2D points for the square
-            square_2d_points = [
-                (screen_pos_edge[0] - square_size, screen_pos_edge[1] - square_size),
-                (screen_pos_edge[0] + square_size, screen_pos_edge[1] - square_size),
-                (screen_pos_edge[0] + square_size, screen_pos_edge[1] + square_size),
-                (screen_pos_edge[0] - square_size, screen_pos_edge[1] + square_size)
-            ]
-
-            # Convert 2D points back to 3D using hovered_edge as the depth reference
-            square_3d_points = [
-                view3d_utils.region_2d_to_location_3d(region, region_3d, point, hovered_edge)
-                for point in square_2d_points
-            ]
-
-            # Check if the points are valid
-            if None not in square_3d_points:
-              #  print(f"3D Points for Edge Square: {square_3d_points}")
-
-                # Draw the square in 3D space
-                gpu.state.line_width_set(1.4)
-                outline_batch = batch_for_shader(
-                    highlight_shader, 'LINE_LOOP', {"pos": square_3d_points}
-                )
-                highlight_shader.bind()
-                highlight_shader.uniform_float("color", (0, 1, 0, 1))  # Green color
-                outline_batch.draw(highlight_shader)
-            else:
-                print("Invalid 3D points for edge square.")
-        else:
-            print("Hovered edge is outside the viewport or screen_pos_edge is None.")
+            draw_square_around_point(screen_pos_edge, hovered_edge, color=(0, 1, 0, 1))  # Green
 
 
-def draw_dashed_line(start, end, dash_length=0.5, gap_length=None, thickness=3):
-    """Draw a dashed line from start to end with customizable dash, gap lengths, thickness, and a solid endpoint."""
+# Function to draw dashed lines with specific colors
+def draw_dashed_line(start, end, dash_length=0.5, gap_length=None, thickness=3, index=None):
     direction = end - start
     length = direction.length
     direction.normalize()
@@ -223,41 +249,27 @@ def draw_dashed_line(start, end, dash_length=0.5, gap_length=None, thickness=3):
     # Set default gap_length to be equal to dash_length if not provided
     gap_length = gap_length if gap_length is not None else dash_length
     segment_length = dash_length + gap_length
-    num_segments = int(length / segment_length)
 
     gpu.state.line_width_set(thickness)  # Set line thickness
-    
-    # Draw dashed segments up to the last full segment
-    for i in range(num_segments):
-        segment_start = start + direction * (i * segment_length)
-        segment_end = segment_start + direction * dash_length
 
-        # Draw each dash segment
-        batch = batch_for_shader(shader, 'LINES', {"pos": [segment_start, segment_end]})
-        shader.bind()
-        shader.uniform_float("color", (1, 1, 0, 1))  # Yellow color
-        batch.draw(shader)
-    
-    # Draw a final segment to the endpoint if the last dash does not reach it
-    final_segment_start = start + direction * (num_segments * segment_length)
-    if (end - final_segment_start).length > 0:
-        batch = batch_for_shader(shader, 'LINES', {"pos": [final_segment_start, end]})
-        shader.bind()
-        shader.uniform_float("color", (1, 1, 0, 1))  # Yellow color
-        batch.draw(shader)
-    
+    # Use the color assigned to the line
+    color = line_colors[index] if index is not None and index < len(line_colors) else (1.0, 1.0, 0.0, 1.0)
+    batch = batch_for_shader(shader, 'LINES', {"pos": [start, end]})
+    shader.bind()
+    shader.uniform_float("color", color)  # Dynamic color
+    batch.draw(shader)
+
     gpu.state.line_width_set(1)  # Reset line thickness after drawing
 
 
 
 
-
-# Function to draw length text dynamically at the midpoint of each line
 # Function to draw length text dynamically at the midpoint of each line
 def draw_callback_px(self, context):
     """Draw the text at the midpoint of each line"""
     font_id = font_info["font_id"]
     font_size = context.scene.font_size  # Get font size from the scene property
+    decimals = context.scene.length_decimals  # Get the number of decimals to display
 
     # Retrieve the scene unit scale and unit name
     unit_settings = context.scene.unit_settings
@@ -297,64 +309,54 @@ def draw_callback_px(self, context):
                 # Set the font size and position for the length text
                 blf.position(font_id, mid_2d[0], mid_2d[1], 0)
                 blf.size(font_id, int(font_size))  # Use the custom font size
-                blf.draw(font_id, f"{round(length, 2)} {unit_label}")
+                blf.draw(font_id, f"{length:.{decimals}f} {unit_label}")
+
 
 # Handler function to update lines based on vertex movement
 def update_lines(scene, depsgraph):
     global lines, line_vertex_refs, line_dynamic_flags
-    
+
+    # Cache evaluated objects and meshes
+    evaluated_objects = {}
+    meshes = {}
+
+    for obj in bpy.context.visible_objects:
+        if obj.type == 'MESH':
+            eval_obj = obj.evaluated_get(depsgraph)
+            mesh = eval_obj.to_mesh()
+            evaluated_objects[obj] = eval_obj
+            meshes[obj] = mesh
+
+    # Update line positions
     for i, (line, refs, dynamic_flags) in enumerate(zip(lines, line_vertex_refs, line_dynamic_flags)):
-        updated_start = line[0]  # Backup start position
-        updated_end = line[1]  # Backup end position
+        updated_start = line[0]
+        updated_end = line[1]
+        print(f"Line {i}: Start ref: {refs[0]}, End ref: {refs[1]}, Dynamic flags: {dynamic_flags}")
 
-        # Update start position if it's marked dynamic
-        if refs[0] is not None and dynamic_flags[0]:  # Check dynamic flag for start
+        # Update start position if dynamic
+        if refs[0] is not None and dynamic_flags[0]:
             obj, vert_idx = refs[0]
-            if obj and vert_idx is not None:
-                try:
-                    # Get the evaluated version of the object
-                    eval_obj = obj.evaluated_get(depsgraph)
-                    mesh = eval_obj.to_mesh()
+            if obj in meshes and vert_idx is not None:
+                updated_start = evaluated_objects[obj].matrix_world @ meshes[obj].vertices[vert_idx].co
 
-                    if vert_idx < len(mesh.vertices):
-                        updated_start = eval_obj.matrix_world @ mesh.vertices[vert_idx].co
-                    else:
-                        #print(f"Vertex index {vert_idx} out of bounds for start point. Falling back to last known position.")
-                        updated_start = line[0]  # Fallback to previous position
-
-                    eval_obj.to_mesh_clear()  # Clear the temporary mesh
-                except Exception as e:
-                    #print(f"Error updating start vertex for line {i}: {e}")
-                    updated_start = line[0]  # Fallback to previous position
-        
-        # Update end position if it's marked dynamic
-        if refs[1] is not None:
+        # Update end position if dynamic
+        if refs[1] is not None and dynamic_flags[1]:
             obj, vert_idx = refs[1]
-            if dynamic_flags[1]:  # Only update if marked as dynamic
-                if obj and vert_idx is not None:
-                    try:
-                        # Get the evaluated version of the object
-                        eval_obj = obj.evaluated_get(depsgraph)
-                        mesh = eval_obj.to_mesh()
+            if obj in meshes and vert_idx is not None:
+                updated_end = evaluated_objects[obj].matrix_world @ meshes[obj].vertices[vert_idx].co
 
-                        if vert_idx < len(mesh.vertices):
-                            updated_end = eval_obj.matrix_world @ mesh.vertices[vert_idx].co
-                        else:
-                           # print(f"Vertex index {vert_idx} out of bounds for end point. Falling back to last known position.")
-                            updated_end = line[1]  # Fallback to previous position
-
-                        eval_obj.to_mesh_clear()  # Clear the temporary mesh
-                    except Exception as e:
-                       # print(f"Error updating end vertex for line {i}: {e}")
-                        updated_end = line[1]  # Fallback to previous position
-
-        # Apply the updated start and end positions to the line
+        # Apply updates
         lines[i] = (updated_start, updated_end)
 
-    # Force viewport update
+    # Clear temporary meshes
+    for obj, mesh in meshes.items():
+        evaluated_objects[obj].to_mesh_clear()
+
+    # Redraw viewport
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
+
 
 
 def init():
@@ -392,20 +394,9 @@ class ModalDrawOperator(bpy.types.Operator):
         # Track whether the mouse is over a known area
         mouse_in_known_area = False
         
-        if event.type == 'X' and event.value == 'PRESS':
-            self.axis_lock['X'] = True
-        elif event.type == 'X' and event.value == 'RELEASE':
-            self.axis_lock['X'] = False
-
-        if event.type == 'Y' and event.value == 'PRESS':
-            self.axis_lock['Y'] = True
-        elif event.type == 'Y' and event.value == 'RELEASE':
-            self.axis_lock['Y'] = False
-
-        if event.type == 'Z' and event.value == 'PRESS':
-            self.axis_lock['Z'] = True
-        elif event.type == 'Z' and event.value == 'RELEASE':
-            self.axis_lock['Z'] = False
+        # Handle axis locking (both PRESS and RELEASE)
+        if event.type in {'X', 'Y', 'Z'}:
+            self.axis_lock[event.type] = (event.value == 'PRESS')
 
         # Find the area under the mouse
         for area in window.screen.areas:
@@ -435,196 +426,99 @@ class ModalDrawOperator(bpy.types.Operator):
 
                 
 
-                    if event.type == 'MOUSEMOVE':
-                        
-                        update_hovered_edge(context, event)
-                        update_hovered_vertex(context, event)
+                    if event.type == 'MOUSEMOVE' and should_update_highlight():
+                        # Update hovered geometry and get results
+                        hovered_vertex, hovered_vertex_ref, hovered_edge, hovered_edge_ref = update_hovered_geometry(context, event)
 
-                        depsgraph = context.evaluated_depsgraph_get()
-                        depsgraph.update()
+                        # Update references in the class
+                        self.hovered_vertex_ref = hovered_vertex_ref
+                        self.hovered_edge_ref = hovered_edge_ref
 
+                        # Trigger viewport redraw if necessary
+                        if hovered_vertex or hovered_edge:
+                            for area in context.screen.areas:
+                                if area.type == 'VIEW_3D':
+                                    area.tag_redraw()
 
-                        best_dist = float('inf')
-                        best_dist_edge = float('inf')
-
-                        region = context.region
-                        region_3d = context.space_data.region_3d
-                        coord = (event.mouse_region_x, event.mouse_region_y)
-
-                        # Get a base 3D position under the mouse without snapping
-                        base_pos = view3d_utils.region_2d_to_location_3d(region, region_3d, coord, context.space_data.region_3d.view_location)
-
-                        # Iterate over all objects in the scene
-                        for obj in context.visible_objects:
-                            if obj.type == 'MESH':
-                                matrix = obj.matrix_world
-
-                                # Check vertices for proximity
-                                for v in obj.data.vertices:
-                                    world_pos = matrix @ v.co
-                                    screen_pos = view3d_utils.location_3d_to_region_2d(region, region_3d, world_pos)
-                                    if screen_pos:
-                                        dist = (Vector(coord) - screen_pos).length
-                                        if dist < vertex_highlight_threshold and dist < best_dist:
-                                            best_dist = dist
-                                            hovered_vertex = world_pos
-                                            self.hovered_vertex_ref = (obj, v.index)
-
-                                # Use raycasting to find the precise intersection on the geometry
-                                if not hovered_vertex:
-                                    view_origin = region_3d.view_matrix.inverted().translation
-                                    view_direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
-
-                                    # Perform raycast
-                                    hit_result = context.scene.ray_cast(
-                                        context.view_layer.depsgraph, view_origin, view_direction
-                                    )
-
-                                    if hit_result[0]:  # Check if the ray hit something
-                                        location = hit_result[1]  # Intersection point
-                                        hovered_point = location  # Snapped point on geometry
-
-                                        for edge in obj.data.edges:
-                                            vert1_world = matrix @ obj.data.vertices[edge.vertices[0]].co
-                                            vert2_world = matrix @ obj.data.vertices[edge.vertices[1]].co
-
-                                            # Use raycast point to find closest edge
-                                            closest_point, t = mathutils.geometry.intersect_point_line(
-                                                hovered_point, vert1_world, vert2_world
-                                            )
-                                            dist = (hovered_point - closest_point).length
-                                            if dist < edge_highlight_threshold and dist < best_dist_edge:
-                                                best_dist_edge = dist
-                                                hovered_edge = closest_point
-                                                self.hovered_edge_ref = (obj, edge.index)
-
-
-
-
-                                                
-
-                        # Start with the base position under the mouse, and apply snapping conditionally
+                        # Update snapping logic based on hovered geometry
                         if self.start_pos is not None:
                             current_pos = mouse_to_3d(context, event, self.start_pos)
 
-                            #print(hovered_edge)
                             if hovered_vertex:
+                                for axis, locked in self.axis_lock.items():
+                                    if locked:
+                                        current_pos["XYZ".index(axis)] = hovered_vertex["XYZ".index(axis)]
                                 if not any(self.axis_lock.values()):
-
                                     current_pos = hovered_vertex
-                                    print("modal: Snapping to vertex.")
-                                else:
-                                    # Snap to the hovered vertex's coordinates, respecting locked axes
-                                    if self.axis_lock['X']:
-                                        current_pos[0] = hovered_vertex[0]  # Keep X axis locked
-                                    if self.axis_lock['Y']:
-                                        current_pos[1] = hovered_vertex[1]  # Keep Y axis locked
-                                    if self.axis_lock['Z']:
-                                        current_pos[2] = hovered_vertex[2]  # Keep Z axis locked
-                                
+
                             elif hovered_edge:
+                                for axis, locked in self.axis_lock.items():
+                                    if locked:
+                                        current_pos["XYZ".index(axis)] = hovered_edge["XYZ".index(axis)]
                                 if not any(self.axis_lock.values()):
                                     current_pos = hovered_edge
-                                    print("modal: Snapping to edge.")
-                                else:
-                                    # Snap to the hovered edge's coordinates, respecting locked axes
-                                    if self.axis_lock['X']:
-                                        current_pos.x = hovered_edge.x
-                                    if self.axis_lock['Y']:
-                                        current_pos.y = hovered_edge.y
-                                    if self.axis_lock['Z']:
-                                        current_pos.z = hovered_edge.z
 
 
                             # Apply axis locking
-                            if self.axis_lock['X']:
-                                current_pos[1] = self.start_pos[1]
-                                current_pos[2] = self.start_pos[2]
-                            if self.axis_lock['Y']:
-                                current_pos[0] = self.start_pos[0]
-                                current_pos[2] = self.start_pos[2]
-                            if self.axis_lock['Z']:
-                                current_pos[0] = self.start_pos[0]
-                                current_pos[1] = self.start_pos[1]
+                            for axis, locked in self.axis_lock.items():
+                                if locked:
+                                    for i, coord in enumerate("XYZ"):
+                                        if coord != axis:
+                                            current_pos[i] = self.start_pos[i]
 
-                            # Ensure a line exists before updating
+                            # Update the current line
                             if lines:
                                 lines[-1][1] = current_pos
                                 self.current_pos = current_pos
                                 context.area.tag_redraw()
 
-
-
-
-
                     elif event.type == 'LEFTMOUSE':
                         if event.value == 'PRESS':
-                            # Set the start position based on hovered vertex or edge
+                            # Set start position and reference based on hover state
                             if hovered_vertex:
-                                self.start_hovered_vertex = hovered_vertex
-                                self.start_pos = hovered_vertex
-                                self.start_vertex_ref = self.hovered_vertex_ref  # Store reference to the vertex
-                               # print(f"Start position set to hovered vertex: {self.start_pos}")
+                                self.start_pos, self.start_hovered_vertex, self.start_vertex_ref = (
+                                    hovered_vertex, hovered_vertex, self.hovered_vertex_ref
+                                )
                             elif hovered_edge:
-                                self.start_pos = hovered_edge  # Snap to the closest point on the edge
-                                self.start_hovered_vertex = None
-                                self.start_vertex_ref = self.hovered_edge_ref  # Store reference to the edge
-                               # print(f"Start position set to hovered edge: {self.start_pos}")
+                                self.start_pos, self.start_hovered_vertex, self.start_vertex_ref = (
+                                    hovered_edge, None, self.hovered_edge_ref
+                                )
                             else:
-                                # Fallback to the 3D mouse location if no vertex or edge is hovered
-                                self.start_pos = mouse_to_3d(context, event, Vector((0, 0, 0)))
-                                self.start_hovered_vertex = None
-                                self.start_vertex_ref = None
-                              #  print(f"Start position set to mouse 3D location: {self.start_pos}")
+                                self.start_pos, self.start_hovered_vertex, self.start_vertex_ref = (
+                                    mouse_to_3d(context, event, Vector((0, 0, 0))), None, None
+                                )
 
-                            # Start a new line with the initial start position
+                            # Start a new line
                             lines.append([self.start_pos.copy(), self.start_pos.copy()])
                             line_vertex_refs.append([self.start_vertex_ref, None])
+                            add_line_color(len(lines) - 1)
+
                         elif event.value == 'RELEASE':
-                            final_position = self.current_pos if self.current_pos else mouse_to_3d(context, event, self.start_pos)
-                            lines[-1][1] = final_position  # Set final position of the line
+                            final_position = self.current_pos or mouse_to_3d(context, event, self.start_pos)
+                            lines[-1][1] = final_position
 
-                            # Clear hovered vertex after setting the final position
-                            current_hovered_vertex = hovered_vertex
-                            hovered_vertex = None  # Clear it explicitly here
-                           # print(f"Hovered vertex cleared on release.")
+                            # Clear hovered vertex
+                            current_hovered_vertex, hovered_vertex = hovered_vertex, None
 
-                            # Determine if the start position should be dynamic with a tolerance check
-                            if self.start_hovered_vertex and (self.start_pos - self.start_hovered_vertex).length < 1e-6:
-                                line_vertex_refs[-1][0] = self.start_vertex_ref
-                                start_dynamic = True
-                           #     print(f"Start position set to dynamic: {self.start_pos}")
-                            else:
-                                line_vertex_refs[-1][0] = None
-                                start_dynamic = False
-                             #   print(f"Start position set to static: {self.start_pos}")
+                            # Determine dynamic or static flags
+                            start_dynamic = (
+                                self.start_hovered_vertex 
+                                and (self.start_pos - self.start_hovered_vertex).length < 1e-6
+                            )
+                            line_vertex_refs[-1][0] = self.start_vertex_ref if start_dynamic else None
 
-                            # Determine if the endpoint should be dynamic by checking closeness
-                            if current_hovered_vertex and (final_position - current_hovered_vertex).length < 1e-6:
-                                line_vertex_refs[-1][1] = self.hovered_vertex_ref
-                                obj, vert_idx = self.hovered_vertex_ref
-                                end_dynamic = True
-                              #  print(f"Endpoint set to dynamic: final_position {final_position} matches hovered_vertex {current_hovered_vertex}, vert_idx {vert_idx}")
-                            else:
-                                # Store the endpoint’s static position if it's not dynamic
-                                line_vertex_refs[-1][1] = (None, final_position)
-                                end_dynamic = False
-                              #  print(f"Endpoint set to static: final_position {final_position} does not match hovered_vertex {current_hovered_vertex}")
+                            end_dynamic = (
+                                current_hovered_vertex 
+                                and (final_position - current_hovered_vertex).length < 1e-6
+                            )
+                            line_vertex_refs[-1][1] = (
+                                self.hovered_vertex_ref if end_dynamic else (None, final_position)
+                            )
 
-                            # Append dynamic flags for this line
                             line_dynamic_flags.append([start_dynamic, end_dynamic])
-                          #  print(f"Dynamic flags for line {len(lines)}: {line_dynamic_flags[-1]}")
 
                             # Reset for the next line
-                            self.start_pos = None
-                            self.start_vertex_ref = None
-                            self.current_pos = None
-
-
-
-
-
-
+                            self.start_pos, self.start_vertex_ref, self.current_pos = None, None, None
 
                     elif event.type in {'RIGHTMOUSE', 'ESC'}:
                         self.cancel(context)
@@ -635,33 +529,19 @@ class ModalDrawOperator(bpy.types.Operator):
                         return {'FINISHED'}
 
                 break  # Exit the area loop as we have already processed the VIEW_3D area
-            if event.type == 'X':
-                if event.value == 'PRESS':
-                    self.restrict_axis = 'X'
-            elif event.type == 'Y':
-                if event.value == 'PRESS':
-                    self.restrict_axis = 'Y'
-            elif event.type == 'Z':
-                if event.value == 'PRESS':
-                    self.restrict_axis = 'Z'
-            elif event.type in {'X', 'Y', 'Z'} and event.value == 'RELEASE':
-                self.restrict_axis = None
-
+            if event.type in {'X', 'Y', 'Z'}:
+              self.restrict_axis = event.type if event.value == 'PRESS' else None
             if context.area:
                 context.area.tag_redraw()
 
         # If the mouse is in an unrecognized area (like top menu), cancel the operation
-        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not mouse_in_known_area and event.value == 'PRESS':
-            self.cancel(context)
-            #print('Pressed in top menu')
-            return {'PASS_THROUGH'}
-
-        # Allow view panning with the middle mouse button in VIEW_3D
-        if event.type == 'MIDDLEMOUSE':
-            return {'PASS_THROUGH'}
-
-        # Allow zooming with mouse wheel or trackpad in VIEW_3D
-        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+        if (
+            (event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not mouse_in_known_area and event.value == 'PRESS') 
+            or event.type == 'MIDDLEMOUSE' 
+            or event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}
+        ):
+            if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MOUSEMOVE'} and not mouse_in_known_area and event.value == 'PRESS':
+                self.cancel(context)
             return {'PASS_THROUGH'}
 
         if context.area:
@@ -736,6 +616,7 @@ def set_font_size(value):
 bpy.types.Scene.font_size = property(get_font_size, set_font_size)
 
 # Update the panel class to include the font size control
+# Update the panel class to include a color picker for each line
 class VIEW3D_PT_draw_line_panel(bpy.types.Panel):
     bl_label = "Draw Measurement Line"
     bl_idname = "VIEW3D_PT_draw_line_panel"
@@ -756,11 +637,19 @@ class VIEW3D_PT_draw_line_panel(bpy.types.Panel):
         # Font size control
         layout.prop(context.scene, "font_size", text="Font Size")
         
+        # Decimal places control
+        layout.prop(context.scene, "length_decimals", text="Decimal Places")
+        
         for index, line in enumerate(lines):
             row = layout.row()
             start, end = line
             row.label(text=f"Line {index + 1}: Start: {start}, End: {end}")
             row.operator("view3d.delete_line", text="Delete").index = index
+
+            # Add a color picker for the line
+            color_row = layout.row()
+            color_row.prop(context.scene, f"line_color_{index}", text="Line Color")
+
 
 class DeleteLineOperator(bpy.types.Operator):
     bl_idname = "view3d.delete_line"
@@ -774,6 +663,7 @@ class DeleteLineOperator(bpy.types.Operator):
         if 0 <= self.index < len(lines):
             # Delete the line, vertex reference, and dynamic flags at the specified index
             lines.pop(self.index)
+            line_colors.pop(self.index)
             line_vertex_refs.pop(self.index)
             line_dynamic_flags.pop(self.index)
             context.area.tag_redraw()
@@ -797,26 +687,40 @@ class ToggleLinesVisibilityOperator(bpy.types.Operator):
                 font_info["handler"] = None
         context.area.tag_redraw()
         return {'FINISHED'}
+# Monitor for mesh changes to invalidate the BVH cache
+@bpy.app.handlers.persistent
+def depsgraph_update(scene, depsgraph):
+    # Call mark_bvh_dirty for updated mesh objects
+    for update in depsgraph.updates:
+        obj = update.id
+        if isinstance(obj, bpy.types.Object) and obj.type == 'MESH':
+            mark_bvh_dirty(obj)
+    
+    # Call update_lines to handle dynamic line updates
+    update_lines(scene, depsgraph)
+
+
+
 # Register the depsgraph update handler
 def register_depsgraph_handler():
-    if update_lines not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(update_lines)
+    if depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(depsgraph_update)
 
-# Unregister the depsgraph update handler
+
 def unregister_depsgraph_handler():
-    if update_lines in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(update_lines)
+    if depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update)
+
 
 # List of classes for registration
 classes = [
-    ModalDrawOperator,
-    VIEW3D_PT_draw_line_panel,
-    ToggleLinesVisibilityOperator,
-    DeleteLineOperator,
+    # Replace with your operator and panel classes
+    # Example:
+     ModalDrawOperator,
+     VIEW3D_PT_draw_line_panel,
+     ToggleLinesVisibilityOperator,
+     DeleteLineOperator,
 ]
-
-
-
 
 
 def register():
@@ -830,13 +734,39 @@ def register():
         min=10.0,
         max=50.0
     )
+    bpy.types.Scene.length_decimals = bpy.props.IntProperty(
+        name="Decimal Places",
+        description="Number of decimal places to display for line lengths",
+        default=2,
+        min=0,
+        max=10
+    )
+
+    # Dynamically add color properties for each line
+    for i in range(len(lines)):
+        prop_name = f"line_color_{i}"
+        setattr(bpy.types.Scene, prop_name, bpy.props.FloatVectorProperty(
+            name=f"Line {i + 1} Color",
+            subtype='COLOR',
+            size=4,
+            default=(1.0, 1.0, 0.0, 1.0),  # Default to yellow
+            min=0.0,
+            max=1.0
+        ))
+        line_colors.append((1.0, 1.0, 0.0, 1.0))  # Default color for each line
 
 def unregister():
     unregister_depsgraph_handler()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.font_size    
+    del bpy.types.Scene.font_size
+    del bpy.types.Scene.length_decimals
 
+    # Dynamically remove color properties for each line
+    for i in range(len(lines)):
+        prop_name = f"line_color_{i}"
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
 
 if __name__ == "__main__":
     register()
